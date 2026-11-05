@@ -23,7 +23,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -52,6 +54,14 @@ HOME_URL = "https://mp.toutiao.com/profile_v4/index"
 
 # 标题长度硬限制（头条标题 2-30 字）
 TITLE_MIN, TITLE_MAX = 2, 30
+
+# 正文图片内联参数。
+# 头条编辑器粘贴时会自动把 data: URI 的图片上传到自己的图床
+# （实测转为 image-tt-private.toutiao.com 域名），所以本地图可以走内联这条路。
+IMG_MAX_WIDTH = 1600      # 超宽先等比缩到这个宽度
+IMG_QUALITY = 85          # JPEG 起始质量
+IMG_MAX_KB = 900          # 单图内联前的体积上限
+IMG_TOTAL_WARN_KB = 8000  # 全文图片总量告警阈值（base64 会膨胀 1/3）
 
 # 选择器候选表：按顺序尝试，命中第一个可见的即为目标。
 # 头条前端会改版，改版后只需在这里补一条，不用动主流程。
@@ -149,8 +159,85 @@ def normalize_title(title: str, rep: Reporter, max_len: int = TITLE_MAX) -> str:
     return title
 
 
-def md_to_html(md_text: str, base_dir: Path, rep: Reporter) -> str:
-    """Markdown -> HTML，并把本地图片换成显式占位（避免静默丢图）。"""
+def local_image_to_data_uri(
+    p: Path,
+    max_width: int = IMG_MAX_WIDTH,
+    quality: int = IMG_QUALITY,
+    max_kb: int = IMG_MAX_KB,
+) -> tuple[str, int] | None:
+    """把本地图片压成 data: URI。返回 (uri, 原始字节数)，失败返回 None。
+
+    头条编辑器在粘贴时会自动把 data: URI 上传到自己的图床（已实测），
+    所以内联是本地图进正文的唯一可靠通道 —— 编辑器不接受 file:// 或相对路径。
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        raw = p.read_bytes()
+        orig = len(raw)
+        suffix = p.suffix.lower()
+
+        im = Image.open(io.BytesIO(raw))
+        need_resize = im.width > max_width
+
+        # 快速通道：体积达标 + 宽度达标 + 已是精简格式 → 原样内联，不做有损重编码。
+        # 注意必须同时判宽度：小体积的大尺寸图（如扁平色块 PNG）也照样要缩。
+        if not need_resize and orig <= max_kb * 1024 and suffix in (".png", ".gif", ".webp"):
+            mime = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}[suffix]
+            return f"data:{mime};base64,{base64.b64encode(raw).decode()}", orig
+        # 动图缩宽会丢帧，宁可不缩也保留动画
+        if suffix == ".gif" and need_resize:
+            return f"data:image/gif;base64,{base64.b64encode(raw).decode()}", orig
+
+        has_alpha = im.mode in ("RGBA", "LA") or (
+            im.mode == "P" and "transparency" in im.info
+        )
+        if need_resize:
+            im = im.resize(
+                (max_width, max(1, round(im.height * max_width / im.width))),
+                Image.LANCZOS,
+            )
+
+        mime = "image/png"
+        buf = io.BytesIO()
+        if has_alpha:
+            im.save(buf, format="PNG", optimize=True)
+            if buf.tell() > max_kb * 1024:
+                # PNG 压不下来就放弃透明通道换 JPEG
+                has_alpha = False
+        if not has_alpha:
+            im = im.convert("RGB")
+            mime = "image/jpeg"
+            q = quality
+            while True:
+                buf.seek(0)
+                buf.truncate()
+                im.save(buf, format="JPEG", quality=q, optimize=True)
+                if buf.tell() <= max_kb * 1024 or q <= 40:
+                    break
+                q -= 10
+
+        data = buf.getvalue()
+        return f"data:{mime};base64,{base64.b64encode(data).decode()}", orig
+    except Exception:
+        return None
+
+
+def md_to_html(
+    md_text: str,
+    base_dir: Path,
+    rep: Reporter,
+    inline_images: bool = True,
+    max_width: int = IMG_MAX_WIDTH,
+    total_warn_kb: int = IMG_TOTAL_WARN_KB,
+) -> str:
+    """Markdown -> HTML。
+
+    inline_images=True 时把本地图片压成 data: URI 内联，由头条编辑器在粘贴时
+    自动上传到图床；关闭或失败则退回显式占位，绝不静默丢图。
+    """
     import markdown
 
     html_body = markdown.markdown(
@@ -162,6 +249,8 @@ def md_to_html(md_text: str, base_dir: Path, rep: Reporter) -> str:
     # 清掉潜在危险标签
     html_body = re.sub(r"<(script|style)\b.*?</\1>", "", html_body, flags=re.S | re.I)
 
+    stats = {"inlined": 0, "placeholder": 0, "total_kb": 0}
+
     def fix_img(m: re.Match) -> str:
         tag = m.group(0)
         src_m = re.search(r"""src\s*=\s*["']([^"']+)["']""", tag)
@@ -169,17 +258,39 @@ def md_to_html(md_text: str, base_dir: Path, rep: Reporter) -> str:
             return ""
         src = src_m.group(1)
         if re.match(r"^(https?:)?//", src) or src.startswith("data:"):
-            return tag  # 远程图 / base64 原样保留
+            return tag  # 远程图 / 已是 base64，原样保留（头条同样会自动转存）
         p = (base_dir / src).resolve()
         name = p.name
-        if p.exists():
-            rep.warn(f"正文图片是本地文件，编辑器无法直接引用，已插入占位：{name}")
-        else:
+
+        if not p.exists():
             rep.warn(f"正文图片不存在，已插入占位：{src}")
-        # 不带 <p>：外层已有段落包裹，再加会形成非法嵌套
+            stats["placeholder"] += 1
+            return f"【图片占位：{name} —— 文件未找到，请手动上传】"
+
+        if inline_images:
+            got = local_image_to_data_uri(p, max_width=max_width)
+            if got:
+                uri, orig = got
+                stats["inlined"] += 1
+                stats["total_kb"] += orig // 1024
+                return f'<img src="{uri}" alt="{name}">'
+
+        rep.warn(f"正文图片无法内联，已插入占位：{name}（请手动上传）")
+        stats["placeholder"] += 1
         return f"【图片占位：{name} —— 请在此处手动上传】"
 
     html_body = re.sub(r"<img\b[^>]*>", fix_img, html_body, flags=re.I)
+
+    if stats["inlined"]:
+        rep.ok(
+            f"正文图片已内联 {stats['inlined']} 张（原始合计 {stats['total_kb']} KB），"
+            "粘贴时头条会自动上传到自己图床"
+        )
+    if stats["inlined"] and stats["total_kb"] > total_warn_kb:
+        rep.warn(
+            f"正文图片总量 {stats['total_kb']} KB 偏大，粘贴可能变慢甚至失败；"
+            "建议在 md 里先压一下图"
+        )
     return html_body
 
 
@@ -357,6 +468,59 @@ class ToutiaoPublisher:
         self.page.goto(PUBLISH_URL, wait_until="domcontentloaded")
         time.sleep(4)
         self.shot("02-发布页")
+        self._ensure_blank_editor()
+
+    def _editor_real_text(self) -> str:
+        """编辑器里的真实文字，剔除占位 widget。
+
+        空编辑器时 ProseMirror 里没有内容，但会塞一个
+        `<span class="syl-placeholder">请输入正文</span>` 当占位提示。
+        直接读 innerText 会得到「请输入正文」5 个字，误判成「有旧内容」，
+        进而触发全选删除 —— 那会把编辑器唯一的空段落删掉，让后续自动保存永久失败。
+        """
+        try:
+            return (
+                self.page.evaluate(
+                    """() => {
+                    const ed = document.querySelector('div.ProseMirror');
+                    if (!ed) return '';
+                    const clone = ed.cloneNode(true);
+                    clone.querySelectorAll(
+                        '.syl-placeholder, .ProseMirror-widget, [ignoreel], [contenteditable="false"]'
+                    ).forEach(n => n.remove());
+                    return (clone.innerText || '').trim();
+                }"""
+                )
+                or ""
+            )
+        except Exception:
+            return ""
+
+    def _ensure_blank_editor(self) -> None:
+        """确认编辑器是空的。
+
+        注意：头条打开发布页可能恢复上一篇草稿，但**空编辑器也会显示占位文字**，
+        必须用 _editor_real_text 剔除占位后再判断，否则会把"空"误判成"有残留"
+        并做出破坏性清空。
+        """
+        left = self._editor_real_text()
+        if not left:
+            self.rep.log("编辑器为空，开始填入")
+            return
+        self.rep.warn(f"编辑器中确有 {len(left)} 字旧内容（头条恢复了上一篇草稿），已清空后重填")
+        self.shot("02b-残留内容-清空前")
+        self._clear_editor(self.page.locator("div.ProseMirror").first)
+        try:
+            # 标题框也可能被旧草稿带出来
+            t = first_visible(self.page, SEL["title"], timeout=2000)
+            if t and (t.input_value() or "").strip():
+                self.rep.warn("标题框也残留了旧标题，已清空")
+                t.fill("")
+        except Exception:
+            pass
+        self.shot("02c-残留内容-清空后")
+        if not self._editor_real_text():
+            self.rep.ok("已清空残留内容")
 
     def fill_title(self, title: str) -> bool:
         loc = first_visible(self.page, SEL["title"], timeout=12000)
@@ -398,11 +562,12 @@ class ToutiaoPublisher:
                 self.rep.log(f"正文填充策略：{strategy}")
                 fn()
                 time.sleep(1.2)
-                got = self._body_length(editor)
-                if got >= 30:
-                    self.rep.ok(f"正文已填入（{got} 字，策略：{strategy}）")
+                got, imgs = self._body_stats(editor)
+                if got >= 30 or imgs >= 1:
+                    extra = f"，图片 {imgs} 张" if imgs else ""
+                    self.rep.ok(f"正文已填入（{got} 字{extra}，策略：{strategy}）")
                     return True
-                self.rep.warn(f"策略「{strategy}」写入后正文仅 {got} 字，降级重试")
+                self.rep.warn(f"策略「{strategy}」写入后正文仅 {got} 字、{imgs} 图，降级重试")
             except Exception as e:
                 self.rep.warn(f"策略「{strategy}」异常：{e}")
             # 清空编辑器再试下一策略
@@ -412,12 +577,36 @@ class ToutiaoPublisher:
         self.shot("05-正文填充失败")
         return False
 
-    def _body_length(self, editor) -> int:
+    def _body_stats(self, editor) -> tuple[int, int]:
+        """返回 (正文字数, 图片数)。纯图文章的文字可能很少，不能只看字数。"""
         try:
-            txt = editor.inner_text() or ""
+            got = self.page.evaluate(
+                """() => {
+                const ed = document.querySelector('div.ProseMirror');
+                if (!ed) return {n: 0, imgs: 0};
+                // 文字：剔除占位 widget，否则空编辑器会被读成「请输入正文」5 个字
+                const clone = ed.cloneNode(true);
+                clone.querySelectorAll(
+                    '.syl-placeholder, .ProseMirror-widget, [ignoreel]'
+                ).forEach(n => n.remove());
+                const txt = (clone.innerText || '').replace(/\\s/g, '');
+                // 图片：头条会给每张图套 wrapper 并藏一份副本，按"可见 + src 去重"计数
+                const seen = new Set();
+                for (const im of ed.querySelectorAll('img')) {
+                    const src = im.getAttribute('src') || '';
+                    if (!src) continue;
+                    const r = im.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) seen.add(src);
+                }
+                return {n: txt.length, imgs: seen.size};
+            }"""
+            )
+            return int(got["n"]), int(got["imgs"])
         except Exception:
-            return 0
-        return len(re.sub(r"\s", "", txt))
+            return 0, 0
+
+    def _body_length(self, editor) -> int:
+        return self._body_stats(editor)[0]
 
     def _clear_editor(self, editor) -> None:
         try:
@@ -588,35 +777,78 @@ class ToutiaoPublisher:
     # -- 自动保存 -------------------------------------------------
 
     def _autosave_hint(self) -> str:
-        """读取页面左下角的保存状态文字。
+        """读取左下角保存状态。
 
-        头条写文章页**没有「存草稿」按钮**，内容靠自动保存，
-        左下角初始显示「草稿将自动保存」，保存后文案会变。
+        头条写文章页没有「存草稿」按钮，内容靠自动保存，
+        左下角 `span.footer-tip-save` 的文案依次是：
+        草稿将自动保存 → 草稿保存中... → 草稿已保存 / 保存失败。
+
+        不能全页面搜「保存」二字：标题本身就常含这个词（如「XX保存测试」），
+        会把标题误当成状态。
         """
         try:
-            txt = self.page.evaluate("() => document.body.innerText || ''")
+            txt = self.page.evaluate(
+                """() => {
+                const el = document.querySelector('.footer-tip-save')
+                        || document.querySelector("[class*='footer-tip-save']");
+                return el ? (el.innerText || '').trim() : '';
+            }"""
+            )
+            return (txt or "").strip()
         except Exception:
             return ""
-        for line in txt.splitlines():
-            s = line.strip()
-            if s and ("保存" in s or re.search(r"共\s*\d+\s*字", s)):
-                return s
-        return ""
+
+    def _save_failed(self) -> bool:
+        """页面上是否出现了保存失败的提示（状态栏或浮动 toast）。"""
+        try:
+            return bool(
+                self.page.evaluate(
+                    """() => {
+                    const t = document.body.innerText || '';
+                    return /保存失败|保存出错|网络异常|请重试/.test(t);
+                }"""
+                )
+            )
+        except Exception:
+            return False
 
     def wait_autosave(self, timeout: int = 30) -> tuple[bool, str]:
-        """等自动保存落盘。返回 (是否检测到已保存, 最后看到的提示文字)。"""
+        """等自动保存落盘。返回 (是否成功, 最后状态文字)。
+
+        三种结局都要能区分，否则会把「失败」误报成「未确认」：
+        已保存 / 保存失败（平台侧拒绝或限流）/ 超时（可能只是慢）。
+        """
         self.rep.log("等待自动保存（头条无存草稿按钮，依赖自动保存）…")
         deadline = time.time() + timeout
+        start = time.time()
         last = ""
+        next_tick = start + 10
+        save_failed_hits = 0
         while time.time() < deadline:
             last = self._autosave_hint()
             if any(h in last for h in ("已保存", "保存成功", "已自动保存")):
-                self.rep.ok(f"自动保存已完成（状态：{last}）")
+                self.rep.ok(f"自动保存已完成（状态：{last}，耗时 {time.time() - start:.0f} 秒）")
                 self.shot("08-已保存")
                 return True, last
+
+            if "失败" in last or self._save_failed():
+                save_failed_hits += 1
+                if save_failed_hits >= 2:  # 连续两次命中才判定，避免偶发 toast
+                    self.rep.err(f"头条返回「保存失败」（状态：{last or '页面提示保存失败'}）")
+                    self.rep.warn(
+                        "常见原因：① 短时间存草稿过多被限流，等几分钟再试；"
+                        "② 正文体积过大（图片多）；③ 网络/登录态异常"
+                    )
+                    self.shot("08-保存失败")
+                    return False, last or "保存失败"
+
+            now = time.time()
+            if now >= next_tick:
+                self.rep.log(f"  仍在保存中…（{now - start:.0f}s，当前：{last or '无提示'}）")
+                next_tick = now + 10
             time.sleep(2)
         self.shot("08-保存状态未确认")
-        self.rep.warn(f"{timeout} 秒内未出现明确的保存完成提示，最后状态：「{last}」")
+        self.rep.warn(f"{timeout} 秒内未确认保存完成，最后状态：「{last or '读不到状态栏'}」")
         return False, last
 
     # -- 调试 -----------------------------------------------------
@@ -709,8 +941,14 @@ def load_history() -> list[dict]:
 
 
 def find_duplicate(title: str, bhash: str) -> dict | None:
-    """标题完全相同，或正文指纹相同，任一命中即判重复。"""
+    """标题完全相同，或正文指纹相同，任一命中即判重复。
+
+    只认 status="draft" 的记录。上一次跑成「unconfirmed」（没等到保存完成就退出）
+    时草稿可能压根没落库，那种记录反而应该允许重试，否则重跑会被自己的失败挡住。
+    """
     for rec in load_history():
+        if rec.get("status") == "unconfirmed":
+            continue
         if title and rec.get("title") == title:
             return rec
         if bhash and rec.get("body_hash") == bhash:
@@ -744,12 +982,24 @@ def load_config() -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def render_body(body: str, md_path: Path, rep: Reporter, cfg: dict) -> str:
+    """统一渲染入口：dry-run 与实跑必须走同一条路径，否则预检会说谎。"""
+    return md_to_html(
+        body,
+        md_path.parent,
+        rep,
+        inline_images=bool(cfg.get("inline_images", True)),
+        max_width=int(cfg.get("image_max_width") or IMG_MAX_WIDTH),
+        total_warn_kb=int(cfg.get("image_total_warn_kb") or IMG_TOTAL_WARN_KB),
+    )
+
+
 def cmd_dry_run(md_path: Path, args, rep: Reporter, title_max: int = TITLE_MAX) -> int:
     raw = md_path.read_text(encoding="utf-8")
     meta, body = split_front_matter(raw)
     title, body = pick_title(meta, body, md_path.stem)
     title = normalize_title(title, rep, title_max)
-    html_body = md_to_html(body, md_path.parent, rep)
+    html_body = render_body(body, md_path, rep, load_config())
     plain = re.sub(r"<[^>]+>", "", html_body)
 
     if args.dump_html:
@@ -767,7 +1017,7 @@ def cmd_dry_run(md_path: Path, args, rep: Reporter, title_max: int = TITLE_MAX) 
     print("\n——— 解析结果（dry-run，未启动浏览器）———")
     print(f"标题      : {title}  ({len(title)} 字)")
     print(f"正文字数  : {len(re.sub(r'\s', '', plain))}")
-    print(f"HTML 长度 : {len(html_body)}")
+    print(f"HTML 体积 : {len(html_body) / 1024:.1f} KB  （含内联图片，越大粘贴越慢）")
     print(f"标签      : {'、'.join(_tags) or '(无)'}{_tag_note}")
     print(f"封面      : {args.cover or meta.get('cover') or '(无，需手动上传)'}")
     stats = inspect_markdown(body)
@@ -928,7 +1178,7 @@ def main() -> int:
     if args.title:
         title = args.title
     title = normalize_title(title, rep, title_max)
-    html_body = md_to_html(body, md_path.parent, rep)
+    html_body = render_body(body, md_path, rep, cfg)
     plain_text = re.sub(r"<[^>]+>", "", html_body)
 
     if args.dump_html:
@@ -990,10 +1240,19 @@ def main() -> int:
             pub.upload_cover(cover)
         else:
             rep.warn("未指定封面，需手动上传")
-        saved, hint = pub.wait_autosave()
+        # 图片要逐张上传到头条图床，耗时随张数线性增长，30 秒远远不够
+        n_imgs = len(re.findall(r"<img\b", html_body, flags=re.I))
+        wait_s = min(300, 30 + 12 * n_imgs)
+        if n_imgs:
+            rep.log(f"正文含 {n_imgs} 张图片，自动保存最长等待 {wait_s} 秒")
+        saved, hint = pub.wait_autosave(timeout=wait_s)
         if saved:
             append_history(title, bhash, account=acct_name, status="draft")
             rep.ok(f"已记入发布历史（累计 {len(load_history())} 条）")
+        elif "失败" in hint:
+            append_history(title, bhash, account=acct_name, status="failed")
+            rep.err("草稿保存失败，内容未落库。浏览器已保持打开，可手动点「预览并发布」页复制内容。")
+            rc = 6
         else:
             append_history(title, bhash, account=acct_name, status="unconfirmed")
             rep.warn(f"已记入历史但标记为「未确认」（状态：{hint}），请到草稿箱核对")
